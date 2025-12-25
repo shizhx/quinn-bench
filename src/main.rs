@@ -12,23 +12,23 @@ struct Args {
     addr: String,
 
     /// Test scenario: stream or dgram
-    #[arg(short = 'n', long)]
+    #[arg(short = 's', long)]
     scene: String,
 
     /// Packet size in bytes
-    #[arg(short = 's', long)]
+    #[arg(short = 'p', long)]
     packet_size: usize,
 
     /// CA certificate path (client mode)
-    #[arg(short, long)]
+    #[arg(long)]
     ca: Option<String>,
 
     /// Server certificate path
-    #[arg(short = 'e', long)]
+    #[arg(long)]
     cert: Option<String>,
 
     /// Server private key path
-    #[arg(short, long)]
+    #[arg(long)]
     key: Option<String>,
 }
 
