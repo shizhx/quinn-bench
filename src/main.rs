@@ -1,7 +1,9 @@
 use bytes::Bytes;
 use clap::Parser;
 use quinn::congestion::{BbrConfig, ControllerFactory, CubicConfig, NewRenoConfig};
-use quinn::{ClientConfig, Endpoint, ServerConfig, TransportConfig};
+use quinn::crypto::rustls::{QuicClientConfig, QuicServerConfig};
+use quinn::{Endpoint, TransportConfig};
+use rustls::client::WebPkiServerVerifier;
 use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, PrivatePkcs8KeyDer};
 use socket2::{Domain, Protocol, Socket, Type};
@@ -115,7 +117,18 @@ fn load_server_config(
     let cert = CertificateDer::from_pem_file(cert_path)?;
     let key = PrivatePkcs8KeyDer::from_pem_file(key_path)?;
 
-    let mut server_config = ServerConfig::with_single_cert(vec![cert], key.into())?;
+    let provider = rustls::crypto::ring::default_provider();
+    let mut server_config = rustls::ServerConfig::builder_with_provider(Arc::new(provider))
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .unwrap()
+        .with_no_client_auth()
+        .with_single_cert(vec![cert], key.into())
+        .unwrap();
+
+    server_config.alpn_protocols = vec![b"h3".to_vec()];
+
+    let server_crypto = QuicServerConfig::try_from(server_config)?;
+    let mut server_config = quinn::ServerConfig::with_crypto(Arc::new(server_crypto));
 
     // 设置传输配置包括拥塞控制算法
     let mut transport_config = create_transport_config(congestion_algorithm);
@@ -138,7 +151,35 @@ fn load_client_config(
     let mut certs = rustls::RootCertStore::empty();
     certs.add(cert)?;
 
-    let mut client_config = ClientConfig::with_root_certificates(Arc::new(certs))?;
+    // 创建 key logger（从 SSLKEYLOGFILE 环境变量读取）
+    // 如果未设置环境变量，则不会记录密钥材料
+    let key_log = Arc::new(rustls::KeyLogFile::new());
+
+    // 检查并打印 key log 状态
+    if std::env::var("SSLKEYLOGFILE").is_ok() {
+        println!("Key logging enabled via SSLKEYLOGFILE environment variable");
+    }
+
+    // 设置密码学密钥提供器
+    let provider = rustls::crypto::ring::default_provider();
+    let verifier =
+        WebPkiServerVerifier::builder_with_provider(Arc::new(certs), Arc::new(provider)).build()?;
+
+    let provider = rustls::crypto::ring::default_provider();
+    let mut config = rustls::ClientConfig::builder_with_provider(Arc::new(provider))
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .unwrap() // The default providers support TLS 1.3
+        .with_webpki_verifier(verifier)
+        .with_no_client_auth();
+
+    config.enable_early_data = true;
+    config.key_log = key_log;
+    config.alpn_protocols = vec![b"h3".to_vec()];
+
+    let client_crypto = QuicClientConfig::try_from(config)?;
+
+    // 创建 quinn ClientConfig
+    let mut client_config = quinn::ClientConfig::new(Arc::new(client_crypto));
 
     // 设置传输配置包括拥塞控制算法
     let mut transport_config = create_transport_config(congestion_algorithm);
