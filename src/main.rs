@@ -134,8 +134,8 @@ fn load_server_config(
     let mut transport_config = create_transport_config(congestion_algorithm);
     transport_config
         .initial_mtu(1500)
-        .datagram_receive_buffer_size(Some(65536))
-        .datagram_send_buffer_size(65536);
+        .datagram_receive_buffer_size(Some(262144))
+        .datagram_send_buffer_size(262144);
     server_config.transport_config(Arc::new(transport_config));
 
     Ok(server_config)
@@ -185,8 +185,8 @@ fn load_client_config(
     let mut transport_config = create_transport_config(congestion_algorithm);
     transport_config
         .initial_mtu(1500)
-        .datagram_receive_buffer_size(Some(65536))
-        .datagram_send_buffer_size(65536);
+        .datagram_receive_buffer_size(Some(262144))
+        .datagram_send_buffer_size(262144);
     client_config.transport_config(Arc::new(transport_config));
 
     Ok(client_config)
@@ -224,26 +224,47 @@ async fn run_dgram_server(args: Args) -> Result<(), Box<dyn std::error::Error>> 
 
     let total_bytes = Arc::new(AtomicU64::new(0));
 
-    // 统计任务：每秒输出统计信息
+    // 统计任务：每秒输出统计信息，以及每 5 秒输出平滑带宽
     let total_bytes_clone = total_bytes.clone();
     tokio::spawn(async move {
         let mut last_bytes = 0u64;
-        let mut ticker = interval(Duration::from_secs(1));
+        let mut bytes_history: Vec<u64> = vec![0; 5]; // 保存最近 5 秒的字节数
+        let mut ticker_1s = interval(Duration::from_secs(1));
+        let mut ticker_5s = interval(Duration::from_secs(5));
 
         loop {
-            ticker.tick().await;
-            let current_bytes = total_bytes_clone.load(Ordering::Relaxed);
-            let delta_bytes = current_bytes - last_bytes;
-            let bandwidth_bps = delta_bytes; // bytes per second
+            tokio::select! {
+                _ = ticker_1s.tick() => {
+                    let current_bytes = total_bytes_clone.load(Ordering::Relaxed);
+                    let delta_bytes = current_bytes - last_bytes;
+                    let bandwidth_bps = delta_bytes; // bytes per second
 
-            let total_mb = current_bytes as f64 / 1024.0 / 1024.0;
-            let bandwidth_mbps = bandwidth_bps as f64 * 8.0 / 1000.0 / 1000.0;
+                    let total_mb = current_bytes as f64 / 1024.0 / 1024.0;
+                    let bandwidth_mbps = bandwidth_bps as f64 * 8.0 / 1000.0 / 1000.0;
 
-            println!(
-                "[STATS] Total received: {:.2} MB, Last second bandwidth: {:.2} Mbps",
-                total_mb, bandwidth_mbps
-            );
-            last_bytes = current_bytes;
+                    println!(
+                        "[STATS] Total received: {:.2} MB, Last second bandwidth: {:.2} Mbps",
+                        total_mb, bandwidth_mbps
+                    );
+
+                    // 更新历史数据：移除最旧的，添加最新的
+                    bytes_history.remove(0);
+                    bytes_history.push(delta_bytes);
+
+                    last_bytes = current_bytes;
+                }
+                _ = ticker_5s.tick() => {
+                    // 计算过去 5 秒的平均带宽
+                    let total_bytes_5s: u64 = bytes_history.iter().sum();
+                    let avg_bytes_per_sec = total_bytes_5s as f64 / 5.0;
+                    let smooth_bandwidth_mbps = avg_bytes_per_sec * 8.0 / 1000.0 / 1000.0;
+
+                    println!(
+                        "[SMOOTH] Last 5 seconds average bandwidth: {:.2} Mbps",
+                        smooth_bandwidth_mbps
+                    );
+                }
+            }
         }
     });
 
