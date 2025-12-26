@@ -7,6 +7,7 @@ use rustls::client::WebPkiServerVerifier;
 use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, PrivatePkcs8KeyDer};
 use socket2::{Domain, Protocol, Socket, Type};
+use std::collections::VecDeque;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -206,6 +207,7 @@ async fn start_stats_task(
     tokio::spawn(async move {
         let mut interval = interval(Duration::from_secs(1));
         let mut last_bytes = 0u64;
+        let mut speed_history: VecDeque<f64> = VecDeque::new();
 
         loop {
             interval.tick().await;
@@ -214,9 +216,22 @@ async fn start_stats_task(
             let total_mb = current_bytes as f64 / (1024.0 * 1024.0);
             let mb_per_sec = bytes_per_sec as f64 / (1000.0 * 1000.0) * 8.0;
 
+            // 将当前速度添加到历史记录中
+            speed_history.push_back(mb_per_sec);
+            // 保持最多10个记录（10秒的历史）
+            if speed_history.len() > 10 {
+                speed_history.pop_front();
+            }
+
+            // 计算最近1秒、5秒、10秒的平均速度
+            let speed_1s = mb_per_sec; // 当前1秒的速度
+            let speed_5s: f64 = speed_history.iter().rev().take(5).sum::<f64>()
+                / (speed_history.len().min(5) as f64);
+            let speed_10s: f64 = speed_history.iter().sum::<f64>() / (speed_history.len() as f64);
+
             println!(
-                "Total {}: {:.2} MB, Speed: {:.2} Mbps",
-                stats_type, total_mb, mb_per_sec
+                "Total {}: {:.2} MB, Speed (1s): {:.2} Mbps, Speed (5s): {:.2} Mbps, Speed (10s): {:.2} Mbps",
+                stats_type, total_mb, speed_1s, speed_5s, speed_10s
             );
             last_bytes = current_bytes;
         }
