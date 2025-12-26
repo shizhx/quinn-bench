@@ -1,5 +1,5 @@
 use bytes::Bytes;
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use quinn::congestion::{BbrConfig, ControllerFactory, CubicConfig, NewRenoConfig};
 use quinn::crypto::rustls::{QuicClientConfig, QuicServerConfig};
 use quinn::{Endpoint, TransportConfig};
@@ -15,23 +15,40 @@ use tokio::time::interval;
 
 const BUFFER_SIZE: usize = 4 * 1024 * 1024; // 4MB
 
+#[derive(Copy, Clone, Debug, ValueEnum)]
+enum Mode {
+    #[value(name = "client")]
+    Client,
+    #[value(name = "server")]
+    Server,
+}
+
+#[derive(Copy, Clone, Debug, ValueEnum)]
+enum Scene {
+    #[value(name = "stream")]
+    Stream,
+    #[value(name = "dgram")]
+    Dgram,
+}
+
 #[derive(Parser, Debug)]
-#[command(version, about, long_about = None)]
+#[command(name = "s2n-bench")]
+#[command(about = "Network throughput testing tool", long_about = None)]
 struct Args {
     /// Running mode: client or server
     #[arg(short, long)]
-    mode: String,
+    mode: Mode,
 
     /// Listen or connect address (ip:port)
-    #[arg(short, long)]
+    #[arg(value_enum, short, long)]
     addr: String,
 
     /// Test scenario: stream or dgram
-    #[arg(short = 's', long)]
-    scene: String,
+    #[arg(value_enum, short = 's', long)]
+    scene: Scene,
 
     /// Packet size in bytes
-    #[arg(short = 'p', long)]
+    #[arg(short = 'p', long, default_value = "1350")]
     packet_size: usize,
 
     /// CA certificate path (client mode)
@@ -56,9 +73,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
 
     println!("=== Command Line Arguments ===");
-    println!("Mode: {}", args.mode);
+    println!("Mode: {:?}", args.mode);
     println!("Addr: {}", args.addr);
-    println!("Scene: {}", args.scene);
+    println!("Scene: {:?}", args.scene);
     println!("Packet Size: {}", args.packet_size);
     println!("CA: {:?}", args.ca);
     println!("Cert: {:?}", args.cert);
@@ -66,24 +83,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("============================");
 
     // 根据模式和场景调用对应的逻辑
-    match args.mode.as_str() {
-        "server" => {
-            if args.scene.as_str() == "dgram" {
-                run_dgram_server(args).await?;
-            } else {
-                return Err(format!("Unsupported scene for server: {}", args.scene).into());
-            }
-        }
-        "client" => {
-            if args.scene.as_str() == "dgram" {
-                run_dgram_client(args).await?;
-            } else {
-                return Err(format!("Unsupported scene for client: {}", args.scene).into());
-            }
-        }
-        _ => {
-            return Err(format!("Unsupported mode: {}", args.mode).into());
-        }
+    match (args.mode, args.scene) {
+        (Mode::Server, Scene::Dgram) => run_dgram_server(args).await?,
+        (Mode::Client, Scene::Dgram) => run_dgram_client(args).await?,
+        (Mode::Client, Scene::Stream) => todo!(),
+        (Mode::Server, Scene::Stream) => todo!(),
     }
 
     Ok(())
@@ -192,6 +196,32 @@ fn load_client_config(
     Ok(client_config)
 }
 
+/// 启动统计任务，定时打印吞吐量信息
+async fn start_stats_task(
+    bytes_counter: Arc<AtomicU64>,
+    stats_type: &str,
+) -> tokio::task::JoinHandle<()> {
+    let stats_type = stats_type.to_string();
+    tokio::spawn(async move {
+        let mut interval = interval(Duration::from_secs(1));
+        let mut last_bytes = 0u64;
+
+        loop {
+            interval.tick().await;
+            let current_bytes = bytes_counter.load(Ordering::Relaxed);
+            let bytes_per_sec = current_bytes - last_bytes;
+            let total_mb = current_bytes as f64 / (1024.0 * 1024.0);
+            let mb_per_sec = bytes_per_sec as f64 / (1000.0 * 1000.0) * 8.0;
+
+            println!(
+                "Total {}: {:.2} MB, Speed: {:.2} Mbps",
+                stats_type, total_mb, mb_per_sec
+            );
+            last_bytes = current_bytes;
+        }
+    })
+}
+
 /// Run dgram server: receive packets and discard them
 async fn run_dgram_server(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     println!("Starting dgram server on {}...", args.addr);
@@ -222,56 +252,14 @@ async fn run_dgram_server(args: Args) -> Result<(), Box<dyn std::error::Error>> 
         Arc::new(quinn::TokioRuntime),
     )?;
 
-    let total_bytes = Arc::new(AtomicU64::new(0));
-
-    // 统计任务：每秒输出统计信息，以及每 5 秒输出平滑带宽
-    let total_bytes_clone = total_bytes.clone();
-    tokio::spawn(async move {
-        let mut last_bytes = 0u64;
-        let mut bytes_history: Vec<u64> = vec![0; 5]; // 保存最近 5 秒的字节数
-        let mut ticker_1s = interval(Duration::from_secs(1));
-        let mut ticker_5s = interval(Duration::from_secs(5));
-
-        loop {
-            tokio::select! {
-                _ = ticker_1s.tick() => {
-                    let current_bytes = total_bytes_clone.load(Ordering::Relaxed);
-                    let delta_bytes = current_bytes - last_bytes;
-                    let bandwidth_bps = delta_bytes; // bytes per second
-
-                    let total_mb = current_bytes as f64 / 1024.0 / 1024.0;
-                    let bandwidth_mbps = bandwidth_bps as f64 * 8.0 / 1000.0 / 1000.0;
-
-                    println!(
-                        "[STATS] Total received: {:.2} MB, Last second bandwidth: {:.2} Mbps",
-                        total_mb, bandwidth_mbps
-                    );
-
-                    // 更新历史数据：移除最旧的，添加最新的
-                    bytes_history.remove(0);
-                    bytes_history.push(delta_bytes);
-
-                    last_bytes = current_bytes;
-                }
-                _ = ticker_5s.tick() => {
-                    // 计算过去 5 秒的平均带宽
-                    let total_bytes_5s: u64 = bytes_history.iter().sum();
-                    let avg_bytes_per_sec = total_bytes_5s as f64 / 5.0;
-                    let smooth_bandwidth_mbps = avg_bytes_per_sec * 8.0 / 1000.0 / 1000.0;
-
-                    println!(
-                        "[SMOOTH] Last 5 seconds average bandwidth: {:.2} Mbps",
-                        smooth_bandwidth_mbps
-                    );
-                }
-            }
-        }
-    });
+    let bytes_received = Arc::new(AtomicU64::new(0));
+    // 启动统计任务
+    let _stats_handle = start_stats_task(Arc::clone(&bytes_received), "received").await;
 
     // 接收连接
     while let Some(conn) = endpoint.accept().await {
         let conn = conn.await?;
-        let total_bytes_clone = total_bytes.clone();
+        let total_bytes_clone = bytes_received.clone();
 
         println!("New connection from: {}", conn.remote_address());
 
@@ -331,12 +319,18 @@ async fn run_dgram_client(args: Args) -> Result<(), Box<dyn std::error::Error>> 
     // 创建测试数据包
     let packet_data = Bytes::copy_from_slice(&vec![0u8; args.packet_size]);
 
+    let bytes_sent = Arc::new(AtomicU64::new(0));
+    // 启动统计任务
+    let _stats_handle = start_stats_task(Arc::clone(&bytes_sent), "sent").await;
+
     println!("Sending packets of {} bytes each...", args.packet_size);
 
     // 疯狂发送数据包
     loop {
         match connection.send_datagram_wait(packet_data.clone()).await {
-            Ok(_) => {}
+            Ok(_) => {
+                bytes_sent.fetch_add(args.packet_size as u64, Ordering::Relaxed);
+            }
             Err(e) => {
                 // 发送失败，可能是缓冲区满，继续尝试
                 eprintln!("Send error: {}", e);
