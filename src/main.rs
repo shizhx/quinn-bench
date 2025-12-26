@@ -314,7 +314,7 @@ async fn run_dgram_client(args: Args) -> Result<(), Box<dyn std::error::Error>> 
 
     // 疯狂发送数据包
     loop {
-        match connection.send_datagram(packet_data.clone()) {
+        match connection.send_datagram_wait(packet_data.clone()).await {
             Ok(_) => {}
             Err(e) => {
                 // 发送失败，可能是缓冲区满，继续尝试
