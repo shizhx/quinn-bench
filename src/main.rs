@@ -80,14 +80,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("CA: {:?}", args.ca);
     println!("Cert: {:?}", args.cert);
     println!("Key: {:?}", args.key);
+    println!("Congestion Algorithm: {:?}", args.congestion_algorithm);
     println!("============================");
 
     // 根据模式和场景调用对应的逻辑
     match (args.mode, args.scene) {
-        (Mode::Server, Scene::Dgram) => run_dgram_server(args).await?,
-        (Mode::Client, Scene::Dgram) => run_dgram_client(args).await?,
-        (Mode::Client, Scene::Stream) => todo!(),
-        (Mode::Server, Scene::Stream) => todo!(),
+        (Mode::Server, Scene::Dgram) => run_quic_server(args).await?,
+        (Mode::Client, Scene::Dgram) => run_quic_client(args).await?,
+        (Mode::Server, Scene::Stream) => run_quic_server(args).await?,
+        (Mode::Client, Scene::Stream) => run_quic_client(args).await?,
     }
 
     Ok(())
@@ -222,9 +223,9 @@ async fn start_stats_task(
     })
 }
 
-/// Run dgram server: receive packets and discard them
-async fn run_dgram_server(args: Args) -> Result<(), Box<dyn std::error::Error>> {
-    println!("Starting dgram server on {}...", args.addr);
+/// Run quic server: receive packets and discard them
+async fn run_quic_server(args: Args) -> Result<(), Box<dyn std::error::Error>> {
+    println!("Starting QUIC server on {}...", args.addr);
 
     let cert_path = args.cert;
     let key_path = args.key;
@@ -265,17 +266,38 @@ async fn run_dgram_server(args: Args) -> Result<(), Box<dyn std::error::Error>> 
 
         // 为每个连接启动接收任务
         tokio::spawn(async move {
-            loop {
-                match conn.read_datagram().await {
-                    Ok(datagram) => {
-                        let bytes = datagram.len() as u64;
-                        total_bytes_clone.fetch_add(bytes, Ordering::Relaxed);
-                    }
-                    Err(e) => {
-                        eprintln!("Error receiving datagram: {}", e);
-                        break;
+            match args.scene {
+                Scene::Stream => {
+                    let (_, mut recv_stream) = conn.accept_bi().await.unwrap();
+                    println!("Accepted new stream: {}", recv_stream.id());
+                    let mut buf = vec![0u8; args.packet_size];
+                    loop {
+                        match recv_stream.read(&mut buf).await {
+                            Ok(size) => {
+                                if let Some(bytes_received) = size {
+                                    total_bytes_clone
+                                        .fetch_add(bytes_received as u64, Ordering::Relaxed);
+                                }
+                            }
+                            Err(e) => {
+                                eprintln!("Error receiving stream: {}", e);
+                                break;
+                            }
+                        }
                     }
                 }
+                Scene::Dgram => loop {
+                    match conn.read_datagram().await {
+                        Ok(datagram) => {
+                            let bytes = datagram.len() as u64;
+                            total_bytes_clone.fetch_add(bytes, Ordering::Relaxed);
+                        }
+                        Err(e) => {
+                            eprintln!("Error receiving datagram: {}", e);
+                            break;
+                        }
+                    }
+                },
             }
         });
     }
@@ -283,9 +305,9 @@ async fn run_dgram_server(args: Args) -> Result<(), Box<dyn std::error::Error>> 
     Ok(())
 }
 
-/// Run dgram client: send packets like crazy
-async fn run_dgram_client(args: Args) -> Result<(), Box<dyn std::error::Error>> {
-    println!("Starting dgram client connecting to {}...", args.addr);
+/// Run quic client: send packets like crazy
+async fn run_quic_client(args: Args) -> Result<(), Box<dyn std::error::Error>> {
+    println!("Starting QUIC client connecting to {}...", args.addr);
 
     let ca_path = args.ca;
     let client_config = load_client_config(&ca_path, &args.congestion_algorithm)?;
@@ -317,7 +339,8 @@ async fn run_dgram_client(args: Args) -> Result<(), Box<dyn std::error::Error>> 
     println!("Connected to server: {}", connection.remote_address());
 
     // 创建测试数据包
-    let packet_data = Bytes::copy_from_slice(&vec![0u8; args.packet_size]);
+    let packet_data = vec![0u8; args.packet_size];
+    let packet_bytes = Bytes::copy_from_slice(&vec![0u8; args.packet_size]);
 
     let bytes_sent = Arc::new(AtomicU64::new(0));
     // 启动统计任务
@@ -326,14 +349,33 @@ async fn run_dgram_client(args: Args) -> Result<(), Box<dyn std::error::Error>> 
     println!("Sending packets of {} bytes each...", args.packet_size);
 
     // 疯狂发送数据包
-    loop {
-        match connection.send_datagram_wait(packet_data.clone()).await {
-            Ok(_) => {
-                bytes_sent.fetch_add(args.packet_size as u64, Ordering::Relaxed);
+    match args.scene {
+        Scene::Stream => {
+            // 打开流
+            let (mut send_stream, _) = connection.open_bi().await.unwrap();
+            println!("Opened stream: {}", send_stream.id());
+            loop {
+                match send_stream.write_all(&packet_data).await {
+                    Ok(_) => {
+                        bytes_sent.fetch_add(args.packet_size as u64, Ordering::Relaxed);
+                    }
+                    Err(e) => {
+                        eprintln!("Failed to write stream: {:?}", e);
+                    }
+                }
             }
-            Err(e) => {
-                // 发送失败，可能是缓冲区满，继续尝试
-                eprintln!("Send error: {}", e);
+        }
+        Scene::Dgram => {
+            loop {
+                match connection.send_datagram_wait(packet_bytes.clone()).await {
+                    Ok(_) => {
+                        bytes_sent.fetch_add(args.packet_size as u64, Ordering::Relaxed);
+                    }
+                    Err(e) => {
+                        // 发送失败，可能是缓冲区满，继续尝试
+                        eprintln!("Send error: {}", e);
+                    }
+                }
             }
         }
     }
