@@ -3,7 +3,7 @@ use clap::{Parser, ValueEnum};
 use log::{error, info};
 use quinn::congestion::{BbrConfig, ControllerFactory, CubicConfig, NewRenoConfig};
 use quinn::crypto::rustls::{QuicClientConfig, QuicServerConfig};
-use quinn::{Endpoint, TransportConfig};
+use quinn::{Endpoint, TransportConfig, VarInt};
 use rustls::client::WebPkiServerVerifier;
 use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, PrivatePkcs8KeyDer};
@@ -13,7 +13,9 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
+use tokio::io::{self, AsyncBufReadExt, BufReader};
 use tokio::time::interval;
+use tokio_util::sync::CancellationToken;
 
 const BUFFER_SIZE: usize = 4 * 1024 * 1024; // 4MB
 
@@ -69,9 +71,17 @@ struct Args {
     #[arg(long = "cc", default_value = "cubic", value_parser = ["cubic", "bbr", "newreno"])]
     congestion_algorithm: String,
 
+    /// Parallel QUIC connection count
+    #[arg(long = "conn", default_value = "1")]
+    max_conn: usize,
+
     /// Parallel QUIC stream count
-    #[arg(long = "parallel", default_value = "1")]
-    parallel_count: usize,
+    #[arg(long = "stream", default_value = "1")]
+    max_stream: usize,
+
+    /// Interactive wait some step
+    #[arg(short, long)]
+    interactive: bool,
 }
 
 #[tokio::main]
@@ -90,7 +100,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Cert: {:?}", args.cert);
     println!("Key: {:?}", args.key);
     println!("Congestion Algorithm: {:?}", args.congestion_algorithm);
-    println!("Parallel count: {:?}", args.parallel_count);
+    println!("Max connection: {:?}", args.max_conn);
+    println!("Max stream: {:?}", args.max_stream);
+    println!("Interactive: {:?}", args.interactive);
     println!("============================");
 
     // 根据模式和场景调用对应的逻辑
@@ -118,7 +130,14 @@ fn create_transport_config(congestion_algorithm: &str) -> TransportConfig {
     let mut config = TransportConfig::default();
     let congestion_controller = create_congestion_controller(congestion_algorithm);
     config.congestion_controller_factory(congestion_controller);
-    config.max_idle_timeout(None);
+    config
+        .max_idle_timeout(None)
+        .initial_mtu(1500)
+        .receive_window(VarInt::from_u32(1024 * 1024 * 24))
+        .stream_receive_window(VarInt::from_u32(1024 * 1024 * 16))
+        .max_concurrent_bidi_streams(VarInt::from_u32(5000))
+        .datagram_receive_buffer_size(Some(1024 * 1024))
+        .datagram_send_buffer_size(1024 * 1024);
     config
 }
 
@@ -146,12 +165,7 @@ fn load_server_config(
     let mut server_config = quinn::ServerConfig::with_crypto(Arc::new(server_crypto));
 
     // 设置传输配置包括拥塞控制算法
-    let mut transport_config = create_transport_config(congestion_algorithm);
-    transport_config
-        .initial_mtu(1500)
-        .datagram_receive_buffer_size(Some(262144))
-        .datagram_send_buffer_size(262144)
-        .max_concurrent_bidi_streams(quinn::VarInt::from_u32(1000000));
+    let transport_config = create_transport_config(congestion_algorithm);
     server_config.transport_config(Arc::new(transport_config));
 
     Ok(server_config)
@@ -198,11 +212,7 @@ fn load_client_config(
     let mut client_config = quinn::ClientConfig::new(Arc::new(client_crypto));
 
     // 设置传输配置包括拥塞控制算法
-    let mut transport_config = create_transport_config(congestion_algorithm);
-    transport_config
-        .initial_mtu(1500)
-        .datagram_receive_buffer_size(Some(262144))
-        .datagram_send_buffer_size(262144);
+    let transport_config = create_transport_config(congestion_algorithm);
     client_config.transport_config(Arc::new(transport_config));
 
     Ok(client_config)
@@ -287,14 +297,21 @@ async fn run_quic_server(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         let conn = conn.await?;
         let total_bytes_clone = bytes_received.clone();
 
+        info!("Accepted connection from {}", conn.remote_address());
+
         // 为每个连接启动接收任务
         tokio::spawn(async move {
             match args.scene {
                 Scene::Stream => loop {
                     let (_, mut recv_stream) = conn.accept_bi().await.unwrap();
-                    info!("Accepted new stream: {}", recv_stream.id());
+                    info!(
+                        "Accepted new stream from {}: {}",
+                        conn.remote_address(),
+                        recv_stream.id()
+                    );
                     let total_bytes = total_bytes_clone.clone();
                     tokio::spawn(async move {
+                        // 每个流一个缓冲区
                         let mut buf = vec![0u8; args.packet_size];
                         loop {
                             match recv_stream.read(&mut buf).await {
@@ -347,7 +364,7 @@ async fn stream_write_all(
 async fn run_quic_client(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     info!("Starting QUIC client connecting to {}...", args.addr);
 
-    let ca_path = args.ca;
+    let ca_path = args.ca.clone();
     let client_config = load_client_config(&ca_path, &args.congestion_algorithm)?;
 
     // 使用 socket2 创建 UDP socket 并设置缓冲区大小
@@ -371,38 +388,75 @@ async fn run_quic_client(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     )?;
 
     let addr: SocketAddr = args.addr.parse().unwrap();
-    let connection = endpoint
-        .connect_with(client_config, addr, "localhost")?
-        .await?;
-    info!("Connected to server: {}", connection.remote_address());
 
     // 创建测试数据包
-    let packet_data = Arc::new(vec![0u8; args.packet_size]);
-    let packet_bytes = Bytes::copy_from_slice(&vec![0u8; args.packet_size]);
+    let packet = Bytes::copy_from_slice(&vec![0u8; args.packet_size]);
+    let total_bytes = Arc::new(AtomicU64::new(0));
+    let args = Arc::new(args);
 
-    let bytes_sent = Arc::new(AtomicU64::new(0));
     // 启动统计任务
-    let _stats_handle = start_stats_task(Arc::clone(&bytes_sent), "sent").await;
+    let _stats_handle = start_stats_task(Arc::clone(&total_bytes), "sent").await;
+    let waiting_signal = CancellationToken::new();
 
-    info!("Sending packets of {} bytes each...", args.packet_size);
+    for _ in 0..args.max_conn {
+        let conn = endpoint
+            .connect_with(client_config.clone(), addr, "localhost")?
+            .await?;
 
+        let packet = packet.clone();
+        let total_bytes = total_bytes.clone();
+        let args = Arc::clone(&args);
+        // 启动任务并等待所有的流都打开
+        start_quic_client_conn_task(conn, args, packet, total_bytes, waiting_signal.clone()).await;
+    }
+
+    info!(
+        "Open {} connections and {} streams to {}",
+        args.max_conn, args.max_stream, args.addr
+    );
+
+    if args.interactive {
+        info!("Press ENTER to continue...");
+        let mut stdin = BufReader::new(io::stdin());
+        let mut line = String::new();
+        stdin.read_line(&mut line).await?;
+    }
+
+    info!("Start QUIC client transfer tasks");
+    waiting_signal.cancel();
+
+    std::future::pending::<()>().await;
+    Ok(())
+}
+
+async fn start_quic_client_conn_task(
+    conn: quinn::Connection,
+    args: Arc<Args>,
+    packet: Bytes,
+    total_bytes: Arc<AtomicU64>,
+    waiting_signal: CancellationToken,
+) {
     // 疯狂发送数据包
+    let packet_size = args.packet_size;
     match args.scene {
         Scene::Stream => {
             // 打开流
-            info!("Starting to open {} streams to server", args.parallel_count);
-            for _ in 0..args.parallel_count {
-                let bytes_sent_clone = bytes_sent.clone();
-                let conn = connection.clone();
-                let buf = packet_data.clone();
+            for _ in 0..args.max_stream {
+                let total_bytes = total_bytes.clone();
+                let buf = packet.clone();
+
+                let (mut send_stream, _) = conn.open_bi().await.unwrap();
+                // 发送数据真正打开流
+                let _ = stream_write_all(&mut send_stream, b"HELLO").await;
+
+                let waiting_signal = waiting_signal.clone();
                 tokio::spawn(async move {
-                    let (mut send_stream, _) = conn.open_bi().await.unwrap();
-                    // info!("Opened stream: {}", send_stream.id());
+                    // 等待开始信号
+                    waiting_signal.cancelled().await;
                     loop {
                         match stream_write_all(&mut send_stream, &buf).await {
                             Ok(_) => {
-                                bytes_sent_clone
-                                    .fetch_add(args.packet_size as u64, Ordering::Relaxed);
+                                total_bytes.fetch_add(packet_size as u64, Ordering::Relaxed);
                             }
                             Err(e) => {
                                 error!("Failed to write stream: {:?}", e);
@@ -411,22 +465,21 @@ async fn run_quic_client(args: Args) -> Result<(), Box<dyn std::error::Error>> {
                     }
                 });
             }
-
-            info!("Success to open {} streams to server", args.parallel_count);
-            loop {}
         }
         Scene::Dgram => {
-            loop {
-                match connection.send_datagram_wait(packet_bytes.clone()).await {
-                    Ok(_) => {
-                        bytes_sent.fetch_add(args.packet_size as u64, Ordering::Relaxed);
-                    }
-                    Err(e) => {
-                        // 发送失败，可能是缓冲区满，继续尝试
-                        error!("Send error: {}", e);
+            tokio::spawn(async move {
+                loop {
+                    match conn.send_datagram_wait(packet.clone()).await {
+                        Ok(_) => {
+                            total_bytes.fetch_add(args.packet_size as u64, Ordering::Relaxed);
+                        }
+                        Err(e) => {
+                            // 发送失败，可能是缓冲区满，继续尝试
+                            error!("Send error: {}", e);
+                        }
                     }
                 }
-            }
+            });
         }
     }
 }
