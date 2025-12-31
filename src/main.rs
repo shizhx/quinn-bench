@@ -79,6 +79,10 @@ struct Args {
     #[arg(long = "stream", default_value = "1")]
     max_stream: usize,
 
+    /// Download mode
+    #[arg(short, long)]
+    download: bool,
+
     /// Interactive wait some step
     #[arg(short, long)]
     interactive: bool,
@@ -86,9 +90,7 @@ struct Args {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    env_logger::Builder::from_default_env()
-        .filter_level(log::LevelFilter::Info) // 默认 info
-        .init();
+    env_logger::init();
     let args = Args::parse();
 
     println!("=== Command Line Arguments ===");
@@ -102,6 +104,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Congestion Algorithm: {:?}", args.congestion_algorithm);
     println!("Max connection: {:?}", args.max_conn);
     println!("Max stream: {:?}", args.max_stream);
+    println!("Download: {:?}", args.download);
     println!("Interactive: {:?}", args.interactive);
     println!("============================");
 
@@ -133,8 +136,8 @@ fn create_transport_config(congestion_algorithm: &str) -> TransportConfig {
     config
         .max_idle_timeout(None)
         .initial_mtu(1500)
-        .receive_window(VarInt::from_u32(1024 * 1024 * 24))
-        .stream_receive_window(VarInt::from_u32(1024 * 1024 * 16))
+        .receive_window(VarInt::from_u32(1024 * 1024 * 2))
+        .stream_receive_window(VarInt::from_u32(1024 * 1024))
         .max_concurrent_bidi_streams(VarInt::from_u32(5000))
         .datagram_receive_buffer_size(Some(1024 * 1024))
         .datagram_send_buffer_size(1024 * 1024);
@@ -289,8 +292,17 @@ async fn run_quic_server(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     )?;
 
     let bytes_received = Arc::new(AtomicU64::new(0));
+    let stat_type = match args.download {
+        true => "sent",
+        false => "received",
+    };
     // 启动统计任务
-    let _stats_handle = start_stats_task(Arc::clone(&bytes_received), "received").await;
+    let _stats_handle = start_stats_task(Arc::clone(&bytes_received), stat_type).await;
+
+    // 待发送数据
+    let packet_size = args.packet_size as u64;
+    let packet = vec![0xABu8; args.packet_size];
+    let packet = Bytes::copy_from_slice(&packet);
 
     // 接收连接
     while let Some(conn) = endpoint.accept().await {
@@ -300,44 +312,74 @@ async fn run_quic_server(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         info!("Accepted connection from {}", conn.remote_address());
 
         // 为每个连接启动接收任务
+        let packet = packet.clone();
         tokio::spawn(async move {
             match args.scene {
                 Scene::Stream => loop {
-                    let (_, mut recv_stream) = conn.accept_bi().await.unwrap();
+                    let (mut send_stream, mut recv_stream) = conn.accept_bi().await.unwrap();
                     info!(
                         "Accepted new stream from {}: {}",
                         conn.remote_address(),
                         recv_stream.id()
                     );
                     let total_bytes = total_bytes_clone.clone();
-                    tokio::spawn(async move {
-                        // 每个流一个缓冲区
-                        let mut buf = vec![0u8; args.packet_size];
-                        loop {
-                            match recv_stream.read(&mut buf).await {
-                                Ok(size) => {
-                                    if let Some(bytes_received) = size {
-                                        total_bytes
-                                            .fetch_add(bytes_received as u64, Ordering::Relaxed);
+                    let packet = packet.clone();
+                    if args.download {
+                        tokio::spawn(async move {
+                            loop {
+                                match stream_write_all(&mut send_stream, &packet).await {
+                                    Ok(_) => {
+                                        total_bytes.fetch_add(packet_size, Ordering::Relaxed);
+                                    }
+                                    Err(e) => {
+                                        error!("Failed to write download stream: {e:?}");
                                     }
                                 }
-                                Err(e) => {
-                                    error!("Error receiving stream: {}", e);
-                                    break;
+                            }
+                        });
+                    } else {
+                        tokio::spawn(async move {
+                            // 每个流一个缓冲区
+                            let mut buf = vec![0u8; args.packet_size];
+                            loop {
+                                match recv_stream.read(&mut buf).await {
+                                    Ok(size) => {
+                                        if let Some(bytes_received) = size {
+                                            total_bytes.fetch_add(
+                                                bytes_received as u64,
+                                                Ordering::Relaxed,
+                                            );
+                                        }
+                                    }
+                                    Err(e) => {
+                                        error!("Error receiving stream: {}", e);
+                                        break;
+                                    }
                                 }
                             }
-                        }
-                    });
+                        });
+                    }
                 },
                 Scene::Dgram => loop {
-                    match conn.read_datagram().await {
-                        Ok(datagram) => {
-                            let bytes = datagram.len() as u64;
-                            total_bytes_clone.fetch_add(bytes, Ordering::Relaxed);
+                    if args.download {
+                        match conn.send_datagram_wait(packet.clone()).await {
+                            Ok(_) => {
+                                total_bytes_clone.fetch_add(packet_size, Ordering::Relaxed);
+                            }
+                            Err(e) => {
+                                error!("Failed to send download datagram: {e:?}");
+                            }
                         }
-                        Err(e) => {
-                            error!("Error receiving datagram: {}", e);
-                            break;
+                    } else {
+                        match conn.read_datagram().await {
+                            Ok(datagram) => {
+                                let bytes = datagram.len() as u64;
+                                total_bytes_clone.fetch_add(bytes, Ordering::Relaxed);
+                            }
+                            Err(e) => {
+                                error!("Error receiving datagram: {}", e);
+                                break;
+                            }
                         }
                     }
                 },
@@ -395,7 +437,11 @@ async fn run_quic_client(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     let args = Arc::new(args);
 
     // 启动统计任务
-    let _stats_handle = start_stats_task(Arc::clone(&total_bytes), "sent").await;
+    let stat_type = match args.download {
+        false => "sent",
+        true => "received",
+    };
+    let _stats_handle = start_stats_task(Arc::clone(&total_bytes), stat_type).await;
     let waiting_signal = CancellationToken::new();
 
     for _ in 0..args.max_conn {
@@ -438,6 +484,7 @@ async fn start_quic_client_conn_task(
 ) {
     // 疯狂发送数据包
     let packet_size = args.packet_size;
+    let download = args.download;
     match args.scene {
         Scene::Stream => {
             // 打开流
@@ -445,37 +492,75 @@ async fn start_quic_client_conn_task(
                 let total_bytes = total_bytes.clone();
                 let buf = packet.clone();
 
-                let (mut send_stream, _) = conn.open_bi().await.unwrap();
+                let (mut send_stream, mut recv_stream) = conn.open_bi().await.unwrap();
                 // 发送数据真正打开流
                 let _ = stream_write_all(&mut send_stream, b"HELLO").await;
 
                 let waiting_signal = waiting_signal.clone();
-                tokio::spawn(async move {
-                    // 等待开始信号
-                    waiting_signal.cancelled().await;
-                    loop {
-                        match stream_write_all(&mut send_stream, &buf).await {
-                            Ok(_) => {
-                                total_bytes.fetch_add(packet_size as u64, Ordering::Relaxed);
-                            }
-                            Err(e) => {
-                                error!("Failed to write stream: {:?}", e);
+                if download {
+                    tokio::spawn(async move {
+                        // 等待开始信号
+                        waiting_signal.cancelled().await;
+                        // 每个流一个缓冲区
+                        let mut buf = vec![0u8; packet_size];
+                        loop {
+                            match recv_stream.read(&mut buf).await {
+                                Ok(size) => {
+                                    if let Some(bytes_received) = size {
+                                        total_bytes
+                                            .fetch_add(bytes_received as u64, Ordering::Relaxed);
+                                    }
+                                }
+                                Err(e) => {
+                                    error!("Error receiving stream: {}", e);
+                                    break;
+                                }
                             }
                         }
-                    }
-                });
+                    });
+                } else {
+                    tokio::spawn(async move {
+                        // 等待开始信号
+                        waiting_signal.cancelled().await;
+                        loop {
+                            match stream_write_all(&mut send_stream, &buf).await {
+                                Ok(_) => {
+                                    total_bytes.fetch_add(packet_size as u64, Ordering::Relaxed);
+                                }
+                                Err(e) => {
+                                    error!("Failed to write stream: {:?}", e);
+                                }
+                            }
+                        }
+                    });
+                }
             }
         }
         Scene::Dgram => {
             tokio::spawn(async move {
-                loop {
-                    match conn.send_datagram_wait(packet.clone()).await {
-                        Ok(_) => {
-                            total_bytes.fetch_add(args.packet_size as u64, Ordering::Relaxed);
+                if download {
+                    loop {
+                        match conn.read_datagram().await {
+                            Ok(datagram) => {
+                                let bytes = datagram.len() as u64;
+                                total_bytes.fetch_add(bytes, Ordering::Relaxed);
+                            }
+                            Err(e) => {
+                                error!("Error receiving datagram: {}", e);
+                                break;
+                            }
                         }
-                        Err(e) => {
-                            // 发送失败，可能是缓冲区满，继续尝试
-                            error!("Send error: {}", e);
+                    }
+                } else {
+                    loop {
+                        match conn.send_datagram_wait(packet.clone()).await {
+                            Ok(_) => {
+                                total_bytes.fetch_add(args.packet_size as u64, Ordering::Relaxed);
+                            }
+                            Err(e) => {
+                                // 发送失败，可能是缓冲区满，继续尝试
+                                error!("Send error: {}", e);
+                            }
                         }
                     }
                 }
